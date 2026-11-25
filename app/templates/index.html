@@ -12,7 +12,7 @@
   th { background: #eef2f6; }
   .muted { color: #5b6b7d; font-size: 12px; }
   .state-basic { color: #8a5a00; font-weight: 600; }
-  .state-upgrading { color: #a33; font-weight: 600; }
+  .state-upgrading, .state-repairing { color: #a33; font-weight: 600; }
   .state-fast { color: #1a7f37; font-weight: 600; }
   form.inline { display: inline; }
   input[type=number], input[type=file] { font-size: 13px; }
@@ -54,7 +54,7 @@
       <td class="state-{{ log.state }}">{{ log.state }}</td>
       <td>{{ log.uncompressed_size }} B</td>
       <td>{{ log.cap_bytes if log.cap_bytes is not none else '—' }}</td>
-      <td class="peak-cell">峰值 {{ log.peak_bytes }} B / 当前 {{ log.current_artifact_bytes }} B</td>
+      <td class="peak-cell">峰值 {{ log.peak_bytes }} B / 当前 {{ log.current_artifact_bytes }} B{% if log.repair_peak_extra_bytes %}<br><span class="muted">修复新增峰值 {{ log.repair_peak_extra_bytes }} B</span>{% endif %}</td>
       <td>
         <a href="/logs/{{ log.id }}/download"><button type="button">整件下载</button></a>
         <a href="/logs/{{ log.id }}/content"><button type="button">解压全文</button></a>
@@ -74,6 +74,13 @@
         <label>故障注入：写失败阈值(B) <input type="number" name="fail_after_bytes" min="0" placeholder="可选"></label>
         <label>重启阈值(B) <input type="number" name="crash_after_bytes" min="0" placeholder="可选"></label>
         <button type="submit">升级</button>
+      </form>
+      &nbsp;|&nbsp;
+      <form class="inline repair-form" data-id="{{ log.id }}">
+        <strong>修复尾段（按原日志号，无需重传）：</strong>
+        <label>写失败阈值(B) <input type="number" name="fail_after_bytes" min="0" placeholder="可选"></label>
+        <label>重启阈值(B) <input type="number" name="crash_after_bytes" min="0" placeholder="可选"></label>
+        <button type="submit">修复大小/尾段</button>
       </form>
       <div id="msg-{{ log.id }}" class="msg"></div>
     </td></tr>
@@ -156,6 +163,37 @@ document.querySelectorAll(".upgrade-form").forEach((form) => {
     } else {
       setMsg("msg-" + id, "升级未生效（" + j.error + "）：" + j.message +
         "；当前状态 " + (j.state || "?") + "，仍可凭原编号取数", false);
+      setTimeout(() => location.reload(), 1500);
+    }
+  });
+});
+
+document.querySelectorAll(".repair-form").forEach((form) => {
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = form.dataset.id;
+    const body = {};
+    new FormData(form).forEach((v, k) => { if (v !== "") body[k] = Number(v); });
+    const r = await fetch(`/logs/${id}/repair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      if (j.changed) {
+        setMsg("msg-" + id,
+          `修复成功：登记大小 ${j.old_uncompressed_size} → ${j.uncompressed_size} B，` +
+          `补齐尾段 ${j.tail_bytes} B，修复新增峰值 ` +
+          `${j.repair_peak_extra_bytes} B`, true);
+      } else {
+        setMsg("msg-" + id,
+          `登记大小 ${j.uncompressed_size} B 已正确，无需修复`, true);
+      }
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      setMsg("msg-" + id, "修复未生效（" + j.error + "）：" + j.message +
+        "；当前状态 " + (j.state || "?") + "，可重试", false);
       setTimeout(() => location.reload(), 1500);
     }
   });

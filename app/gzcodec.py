@@ -37,7 +37,16 @@ class SimulatedWriteFailure(RuntimeError):
 
 
 def iter_decompressed(fp, buf_size: int = 65536):
-    """Yield decompressed chunks from a (possibly multi-member) standard gzip file."""
+    """Yield decompressed chunks from a (possibly multi-member) standard gzip file.
+
+    A gzip member can end exactly at a read() boundary: the final bytes of one
+    member may arrive in a chunk of exactly ``buf_size`` bytes, while the next
+    member only appears on the following read(). In that case ``unused_data`` is
+    still empty when EOF is first observed, so the loop must issue one more read
+    before concluding the stream is finished -- otherwise every member after a
+    boundary-aligned member would silently disappear (the classic "the web view
+    misses the tail of the log but the original download is complete" bug).
+    """
     pending = b""  # bytes read but not yet fed to a decompressobj
     d = zlib.decompressobj(GZIP_WBITS)
     fed = False
@@ -55,11 +64,19 @@ def iter_decompressed(fp, buf_size: int = 65536):
             if tail:
                 yield tail
             pending = d.unused_data  # start of the next member, if any
-            if not pending:
-                return
-            d = zlib.decompressobj(GZIP_WBITS)
-            fed = False
-            continue
+            if pending:
+                # Next member's bytes already rode in on the same read chunk.
+                d = zlib.decompressobj(GZIP_WBITS)
+                fed = False
+                continue
+            # The member ended at (or before) the end of the last read chunk.
+            # One more read decides whether another member follows.
+            pending = fp.read(buf_size)
+            if pending:
+                d = zlib.decompressobj(GZIP_WBITS)
+                fed = False
+                continue
+            return
         if not pending:
             # Input exhausted while the current member is unfinished.
             if not fed:
@@ -152,6 +169,90 @@ def rebuild_multimember(src_path: str, write, member_size: int = MEMBER_SIZE):
         "members": members,
     }
     return index, total
+
+
+def rebuild_tail_members(src_path: str, skip_uncompressed: int, write,
+                         member_size: int = MEMBER_SIZE):
+    """Recompress only the uncompressed tail after ``skip_uncompressed`` bytes.
+
+    Used by the legacy-log repair: the already readable prefix (and the fast
+    artifacts covering it) is left untouched, so new disk usage grows only with
+    the missing tail. Emits concatenated independent gzip members of at most
+    ``member_size`` uncompressed bytes each, exactly like rebuild_multimember.
+
+    Returns (members, tail_size, total_size) where members is an index-table
+    fragment (same uoff/usize/coff/csize fields; offsets are absolute, compressed
+    offsets start at zero relative to the staging file), tail_size is the number
+    of uncompressed bytes the fragment covers, and total_size is the true total
+    uncompressed size of the source gzip.
+    """
+    members = []
+    coff = 0
+    uoff = skip_uncompressed
+    member_used = 0
+    total = 0
+    member_start_written = 0
+    cobj = zlib.compressobj(6, zlib.DEFLATED, GZIP_WBITS)
+    account = {"bytes": 0}
+    raw_write = write
+
+    def gzip_write(data):
+        raw_write(data)
+        account["bytes"] += len(data)
+
+    write = gzip_write
+
+    def close_member():
+        nonlocal coff, uoff, cobj, member_used, member_start_written
+        tail = cobj.flush()
+        if tail:
+            write(tail)
+        csize = account["bytes"] - member_start_written
+        members.append({
+            "uoff": uoff,
+            "usize": member_used,
+            "coff": coff,
+            "csize": csize,
+        })
+        coff += csize
+        uoff += member_used
+        cobj = zlib.compressobj(6, zlib.DEFLATED, GZIP_WBITS)
+        member_used = 0
+        member_start_written = account["bytes"]
+
+    with open(src_path, "rb") as src:
+        remaining_skip = skip_uncompressed
+        pending = b""
+        for chunk in iter_decompressed(src):
+            total += len(chunk)
+            if remaining_skip > 0:
+                if len(chunk) <= remaining_skip:
+                    remaining_skip -= len(chunk)
+                    continue
+                chunk = chunk[remaining_skip:]
+                remaining_skip = 0
+            pending += chunk
+            while pending:
+                room = member_size - member_used
+                take = pending[:room]
+                pending = pending[room:]
+                if take:
+                    out = cobj.compress(take)
+                    if out:
+                        write(out)
+                    member_used += len(take)
+                if member_used == member_size:
+                    close_member()
+        # Flush the final member whenever the tail is non-empty.
+        if member_used or members:
+            close_member()
+
+    tail_size = total - skip_uncompressed
+    if tail_size < 0:
+        raise GzipError(
+            f"source uncompressed size {total} is smaller than the registered "
+            f"readable size {skip_uncompressed}; refusing repair")
+    return members, tail_size, total
 
 
 def read_index(path: str) -> dict:

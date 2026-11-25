@@ -33,11 +33,11 @@ from .gzcodec import (
     GzipError,
     QuotaExceeded,
     SimulatedWriteFailure,
-    read_index,
     read_range_basic,
     read_range_fast,
 )
-from .storage import Store, STATE_FAST
+from .repair import run_repair
+from .storage import STATE_FAST, Store
 from .upgrade import UpgradeError, run_upgrade
 
 MAX_RANGE_LENGTH = 64 * 1024
@@ -68,6 +68,8 @@ def create_app(data_dir: str | None = None) -> Flask:
         for log in store.list_logs():
             peak = store.load_peak(log["id"])
             log["peak_bytes"] = max(log.get("peak_bytes", 0), peak["peak_bytes"])
+            log["repair_peak_extra_bytes"] = peak.get(
+                "repair_peak_extra_bytes", 0)
             log["current_artifact_bytes"] = peak["current_bytes"]
             logs.append(log)
         return render_template(
@@ -136,11 +138,13 @@ def create_app(data_dir: str | None = None) -> Flask:
         if start >= entry["uncompressed_size"]:
             abort(416, description="start is beyond end of log")
 
-        # Fast only when committed. While upgrading (or in basic mode) the original
-        # gzip serves the read; both modes therefore keep working during an upgrade.
+        # Fast only when committed. While upgrading/repairing (or in basic mode)
+        # the original gzip serves the read; both modes therefore keep working
+        # while a repair or an upgrade is in progress.
         if entry["state"] == STATE_FAST and os.path.exists(store.gzip_path(log_id)):
             try:
-                index = read_index(store.index_path(log_id))
+                # The committed index includes any tail-repair fragment.
+                index = store.load_fast_index(log_id)
                 data, decompressed = read_range_fast(
                     store.gzip_path(log_id), index, start, length
                 )
@@ -206,12 +210,47 @@ def create_app(data_dir: str | None = None) -> Flask:
         finally:
             lock.release()
 
+    @app.post("/logs/<int:log_id>/repair")
+    def repair(log_id: int):
+        """Re-measure the original gzip and bring a truncated log up to size.
+
+        Works for both basic and fast logs under the same log number; no
+        re-upload is needed. Optional fault-injection fields mirror the upgrade
+        endpoint (fail_after_bytes / crash_after_bytes).
+        """
+        entry_or_404(log_id)
+        payload = request.get_json(silent=True) or request.form
+        fault = {}
+        for key in ("fail_after_bytes", "crash_after_bytes"):
+            raw = payload.get(key)
+            if raw not in (None, ""):
+                try:
+                    fault[key] = int(raw)
+                except (TypeError, ValueError):
+                    abort(400, description=f"{key} must be an integer")
+
+        lock = get_lock(log_id)
+        if not lock.acquire(blocking=False):
+            abort(409, description="a repair/upgrade for this log is running")
+        try:
+            result = run_repair(store, log_id, fault=fault or None)
+            return jsonify(result)
+        except SimulatedWriteFailure as exc:
+            return jsonify({"error": "simulated_write_failure", "message": str(exc),
+                            "state": store.get(log_id)["state"]}), 500
+        except (GzipError, UpgradeError) as exc:
+            abort(400, description=str(exc))
+        finally:
+            lock.release()
+
     @app.get("/logs/<int:log_id>/status")
     def status(log_id: int):
         entry = entry_or_404(log_id)
         info = dict(entry)
         peak = store.load_peak(log_id)
         info["peak_bytes"] = max(entry.get("peak_bytes", 0), peak["peak_bytes"])
+        info["repair_peak_extra_bytes"] = peak.get(
+            "repair_peak_extra_bytes", 0)
         info["current_artifact_bytes"] = store.fast_artifacts_bytes(log_id)
         info["original_gzip_bytes"] = os.path.getsize(store.original_path(log_id))
         return jsonify(info)
