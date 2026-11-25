@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>gzip 日志归档取数</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; margin: 24px; color: #1a2330; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 28px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #c9d2dc; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #eef2f6; }
+  .muted { color: #5b6b7d; font-size: 12px; }
+  .state-basic { color: #8a5a00; font-weight: 600; }
+  .state-upgrading { color: #a33; font-weight: 600; }
+  .state-fast { color: #1a7f37; font-weight: 600; }
+  form.inline { display: inline; }
+  input[type=number], input[type=file] { font-size: 13px; }
+  button { font-size: 13px; padding: 3px 10px; cursor: pointer; }
+  pre { background: #0f1720; color: #d6e2ee; padding: 12px; border-radius: 6px;
+        white-space: pre-wrap; word-break: break-all; max-height: 320px; overflow: auto; }
+  .msg { font-size: 13px; margin: 6px 0; }
+  .ok { color: #1a7f37; } .err { color: #b42318; }
+  .panel { border: 1px solid #c9d2dc; border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+  label { font-size: 13px; margin-right: 8px; }
+</style>
+</head>
+<body>
+<h1>gzip 旧日志归档 — 字节偏移取数</h1>
+<p class="muted">区间读取每次最多 {{ max_range }} 字节（64 KiB）；快速模式下实际解压不超过
+{{ max_decompress }} 字节（256 KiB）。原 gzip 不占新增文件配额。</p>
+
+<div class="panel">
+  <h2 style="margin-top:0">1. 上传标准 gzip（自动分配日志号）</h2>
+  <form id="upload-form">
+    <input type="file" name="file" accept=".gz,.gzip,application/gzip" required>
+    <button type="submit">上传</button>
+  </form>
+  <div id="upload-msg" class="msg"></div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">2. 日志列表</h2>
+  <table>
+    <thead><tr>
+      <th>日志号</th><th>文件名</th><th>状态</th><th>解压后大小</th>
+      <th>新增文件上限</th><th>实际峰值 / 当前占用</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+    {% for log in logs %}
+    <tr id="row-{{ log.id }}">
+      <td>{{ log.id }}</td>
+      <td>{{ log.filename }}</td>
+      <td class="state-{{ log.state }}">{{ log.state }}</td>
+      <td>{{ log.uncompressed_size }} B</td>
+      <td>{{ log.cap_bytes if log.cap_bytes is not none else '—' }}</td>
+      <td class="peak-cell">峰值 {{ log.peak_bytes }} B / 当前 {{ log.current_artifact_bytes }} B</td>
+      <td>
+        <a href="/logs/{{ log.id }}/download"><button type="button">整件下载</button></a>
+        <a href="/logs/{{ log.id }}/content"><button type="button">解压全文</button></a>
+      </td>
+    </tr>
+    <tr class="tools-row"><td colspan="7">
+      <form class="inline range-form" data-id="{{ log.id }}">
+        <strong>区间读取：</strong>
+        <label>起点 <input type="number" name="start" min="0" value="0" required></label>
+        <label>长度 <input type="number" name="length" min="1" max="{{ max_range }}" value="4096" required></label>
+        <button type="submit">取原始字节</button>
+      </form>
+      &nbsp;|&nbsp;
+      <form class="inline upgrade-form" data-id="{{ log.id }}">
+        <strong>开启快速取数：</strong>
+        <label>新增文件上限(B) <input type="number" name="cap_bytes" min="1" value="1048576" required></label>
+        <label>故障注入：写失败阈值(B) <input type="number" name="fail_after_bytes" min="0" placeholder="可选"></label>
+        <label>重启阈值(B) <input type="number" name="crash_after_bytes" min="0" placeholder="可选"></label>
+        <button type="submit">升级</button>
+      </form>
+      <div id="msg-{{ log.id }}" class="msg"></div>
+    </td></tr>
+    {% else %}
+    <tr><td colspan="7" class="muted">暂无日志</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">3. 区间读取结果</h2>
+  <div id="range-meta" class="msg muted">尚未读取</div>
+  <pre id="range-out">（原始字节以文本形式预览，二进制内容可能显示为乱码）</pre>
+</div>
+
+<script>
+function setMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  el.className = "msg " + (ok ? "ok" : "err");
+  el.textContent = text;
+}
+
+document.getElementById("upload-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch("/upload", { method: "POST", body: fd });
+  const j = await r.json();
+  if (r.ok) {
+    setMsg("upload-msg", "已分配日志号 " + j.id + "，解压后 " + j.uncompressed_size + " 字节", true);
+    setTimeout(() => location.reload(), 800);
+  } else {
+    setMsg("upload-msg", "上传失败：" + j.message, false);
+  }
+});
+
+document.querySelectorAll(".range-form").forEach((form) => {
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = form.dataset.id;
+    const p = new URLSearchParams(new FormData(form));
+    const r = await fetch(`/logs/${id}/range?` + p.toString());
+    const meta = document.getElementById("range-meta");
+    const out = document.getElementById("range-out");
+    if (!r.ok) {
+      const j = await r.json();
+      meta.className = "msg err";
+      meta.textContent = "读取失败：" + j.message;
+      return;
+    }
+    const buf = await r.arrayBuffer();
+    meta.className = "msg ok";
+    meta.textContent =
+      `日志 ${id} 区间读取成功：模式=${r.headers.get("X-Read-Mode")}，` +
+      `返回 ${r.headers.get("X-Length")} 字节，` +
+      `本次实际解压 ${r.headers.get("X-Decompressed-Bytes")} 字节` +
+      `（上限 ${r.headers.get("X-Max-Decompress-Limit")} 字节）`;
+    out.textContent = new TextDecoder("utf-8", { fatal: false })
+      .decode(new Uint8Array(buf));
+  });
+});
+
+document.querySelectorAll(".upgrade-form").forEach((form) => {
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = form.dataset.id;
+    const body = {};
+    new FormData(form).forEach((v, k) => { if (v !== "") body[k] = Number(v); });
+    const r = await fetch(`/logs/${id}/upgrade`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      setMsg("msg-" + id,
+        `升级成功：gzip ${j.gzip_bytes} B + 索引 ${j.index_bytes} B，` +
+        `实际峰值 ${j.peak_bytes} B / 上限 ${j.cap_bytes} B`, true);
+      setTimeout(() => location.reload(), 1000);
+    } else {
+      setMsg("msg-" + id, "升级未生效（" + j.error + "）：" + j.message +
+        "；当前状态 " + (j.state || "?") + "，仍可凭原编号取数", false);
+      setTimeout(() => location.reload(), 1500);
+    }
+  });
+});
+</script>
+</body>
+</html>
